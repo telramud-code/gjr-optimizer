@@ -461,7 +461,6 @@ export default function App() {
     setSelected(prev => prev.size === TICKERS.length ? new Set() : new Set(TICKERS));
 
   const run = useCallback(async () => {
-    if (!apiKey.trim()) { setError("Ingresá tu API key de Financial Modeling Prep."); return; }
     if (selectedETFs.size < 3) { setError("Seleccioná al menos 3 ETFs."); return; }
     setRunning(true); setError(""); setResult(null); setLogs([]); setProgress(0);
 
