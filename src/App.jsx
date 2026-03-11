@@ -247,33 +247,158 @@ function fitGJRGARCH(returns) {
   return { omega, alpha, gamma, beta, condVol, h };
 }
 
-// Hidden Markov Model — 2 states (Bull/Bear) via Viterbi approximation
+// ─── HMM 3-STATE (Bull / Lateral / Bear) — Baum-Welch + Viterbi ─────────────
+// States: 0=Bear, 1=Lateral, 2=Bull
+
+function gaussianPdf(x, mu, sigma) {
+  if (sigma < 1e-10) return x === mu ? 1 : 0;
+  return Math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * Math.sqrt(2 * Math.PI));
+}
+
 function fitHMM(returns) {
   const n = returns.length;
-  const m = mean(returns);
-  const s = std(returns);
+  const K = 3; // states: 0=Bear, 1=Lateral, 2=Bull
 
-  // Classify states by return quantile
-  const states = returns.map(r => r < m - 0.3 * s ? 0 : 1); // 0=Bear, 1=Bull
+  // --- Initialize parameters using percentiles ---
+  const sorted = [...returns].sort((a, b) => a - b);
+  const p33 = sorted[Math.floor(n * 0.33)];
+  const p67 = sorted[Math.floor(n * 0.67)];
 
-  // Transition matrix
-  const trans = [[0, 0], [0, 0]];
-  const count = [0, 0];
-  for (let i = 0; i < n - 1; i++) {
-    trans[states[i]][states[i + 1]]++;
-    count[states[i]]++;
+  // Emission params per state [Bear, Lateral, Bull]
+  let mu    = [mean(sorted.slice(0, Math.floor(n*0.33))), mean(sorted.slice(Math.floor(n*0.33), Math.floor(n*0.67))), mean(sorted.slice(Math.floor(n*0.67)))];
+  let sigma = [std(sorted.slice(0, Math.floor(n*0.33))) || 0.01, std(sorted.slice(Math.floor(n*0.33), Math.floor(n*0.67))) || 0.005, std(sorted.slice(Math.floor(n*0.67))) || 0.01];
+
+  // Transition matrix — favour staying in same state
+  let A = [
+    [0.85, 0.10, 0.05],
+    [0.10, 0.80, 0.10],
+    [0.05, 0.10, 0.85],
+  ];
+
+  // Initial state distribution
+  let pi = [0.33, 0.34, 0.33];
+
+  // --- Baum-Welch EM iterations ---
+  const MAX_ITER = 30;
+  for (let iter = 0; iter < MAX_ITER; iter++) {
+    // E-step: forward-backward
+    // Forward pass (scaled)
+    const alpha = [];
+    const scale = new Array(n).fill(0);
+    alpha[0] = pi.map((p, k) => p * gaussianPdf(returns[0], mu[k], sigma[k]));
+    scale[0] = alpha[0].reduce((s, x) => s + x, 0) || 1e-300;
+    alpha[0] = alpha[0].map(x => x / scale[0]);
+
+    for (let t = 1; t < n; t++) {
+      alpha[t] = Array(K).fill(0);
+      for (let j = 0; j < K; j++) {
+        let s = 0;
+        for (let i = 0; i < K; i++) s += alpha[t-1][i] * A[i][j];
+        alpha[t][j] = s * gaussianPdf(returns[t], mu[j], sigma[j]);
+      }
+      scale[t] = alpha[t].reduce((s, x) => s + x, 0) || 1e-300;
+      alpha[t] = alpha[t].map(x => x / scale[t]);
+    }
+
+    // Backward pass (scaled)
+    const beta = Array(n).fill(null).map(() => Array(K).fill(0));
+    beta[n-1] = Array(K).fill(1);
+    for (let t = n-2; t >= 0; t--) {
+      for (let i = 0; i < K; i++) {
+        let s = 0;
+        for (let j = 0; j < K; j++)
+          s += A[i][j] * gaussianPdf(returns[t+1], mu[j], sigma[j]) * beta[t+1][j];
+        beta[t][i] = s / scale[t+1];
+      }
+    }
+
+    // Gamma and Xi
+    const gamma = alpha.map((a, t) => {
+      const s = a.reduce((sum, x, k) => sum + x * beta[t][k], 0) || 1e-300;
+      return a.map((x, k) => x * beta[t][k] / s);
+    });
+
+    const xi = Array(n-1).fill(null).map((_, t) => {
+      const mat = Array(K).fill(null).map(() => Array(K).fill(0));
+      let norm = 0;
+      for (let i = 0; i < K; i++)
+        for (let j = 0; j < K; j++) {
+          mat[i][j] = alpha[t][i] * A[i][j] * gaussianPdf(returns[t+1], mu[j], sigma[j]) * beta[t+1][j];
+          norm += mat[i][j];
+        }
+      norm = norm || 1e-300;
+      return mat.map(row => row.map(v => v / norm));
+    });
+
+    // M-step: update parameters
+    pi = gamma[0].map(g => Math.max(g, 1e-6));
+    const piSum = pi.reduce((s, x) => s + x, 0);
+    pi = pi.map(p => p / piSum);
+
+    // Update A
+    for (let i = 0; i < K; i++) {
+      const rowSum = xi.reduce((s, x) => s + x[i].reduce((a, b) => a + b, 0), 0) || 1e-300;
+      for (let j = 0; j < K; j++) {
+        A[i][j] = Math.max(xi.reduce((s, x) => s + x[i][j], 0) / rowSum, 1e-6);
+      }
+      const aSum = A[i].reduce((s, x) => s + x, 0);
+      A[i] = A[i].map(v => v / aSum);
+    }
+
+    // Update emission params
+    for (let k = 0; k < K; k++) {
+      const gk = gamma.map(g => g[k]);
+      const gkSum = gk.reduce((s, x) => s + x, 0) || 1e-300;
+      mu[k] = gk.reduce((s, g, t) => s + g * returns[t], 0) / gkSum;
+      const v = gk.reduce((s, g, t) => s + g * (returns[t] - mu[k]) ** 2, 0) / gkSum;
+      sigma[k] = Math.max(Math.sqrt(v), 1e-4);
+    }
   }
-  const P = trans.map((row, i) => row.map(v => count[i] > 0 ? v / count[i] : 0.5));
 
-  // Current regime based on last 20 days
-  const recent = returns.slice(-20);
-  const recentMean = mean(recent);
-  const currentRegime = recentMean > m ? "bull" : "bear";
-  const regimeConf = Math.min(0.99, Math.abs(recentMean - m) / s * 0.5 + 0.5);
-  const bullDays = states.filter(s => s === 1).length;
-  const bullFraction = bullDays / n;
+  // --- Viterbi decoding ---
+  const viterbi = Array(n).fill(null).map(() => Array(K).fill(0));
+  const psi     = Array(n).fill(null).map(() => Array(K).fill(0));
+  for (let k = 0; k < K; k++)
+    viterbi[0][k] = Math.log(pi[k] + 1e-300) + Math.log(gaussianPdf(returns[0], mu[k], sigma[k]) + 1e-300);
 
-  return { P, currentRegime, regimeConf, bullFraction, states };
+  for (let t = 1; t < n; t++) {
+    for (let j = 0; j < K; j++) {
+      let best = -Infinity, bestK = 0;
+      for (let i = 0; i < K; i++) {
+        const v = viterbi[t-1][i] + Math.log(A[i][j] + 1e-300);
+        if (v > best) { best = v; bestK = i; }
+      }
+      viterbi[t][j] = best + Math.log(gaussianPdf(returns[t], mu[j], sigma[j]) + 1e-300);
+      psi[t][j] = bestK;
+    }
+  }
+
+  // Backtrack
+  const stateSeq = new Array(n);
+  stateSeq[n-1] = viterbi[n-1].indexOf(Math.max(...viterbi[n-1]));
+  for (let t = n-2; t >= 0; t--) stateSeq[t] = psi[t+1][stateSeq[t+1]];
+
+  // Current regime: majority of last 20 days
+  const recent = stateSeq.slice(-20);
+  const counts = [0, 0, 0];
+  recent.forEach(s => counts[s]++);
+  const currentStateIdx = counts.indexOf(Math.max(...counts));
+  const regimeMap = ["bear", "lateral", "bull"];
+  const currentRegime = regimeMap[currentStateIdx];
+  const regimeConf = counts[currentStateIdx] / 20;
+
+  // State fractions
+  const stateFractions = counts.map(c => +(c / 20).toFixed(2));
+
+  // Emission stats per state
+  const stateStats = [0,1,2].map(k => ({
+    label: ["Bear","Lateral","Bull"][k],
+    mu:    +(mu[k] * 252 * 100).toFixed(2),   // annualized %
+    sigma: +(sigma[k] * Math.sqrt(252) * 100).toFixed(2),
+    days:  stateSeq.filter(s => s === k).length,
+  }));
+
+  return { A, mu, sigma, pi, stateSeq, currentRegime, regimeConf, stateFractions, stateStats };
 }
 
 // CVaR calculation
@@ -313,11 +438,13 @@ function optimizeCVaR(retMatrix, selectedTickers, nIter = 3000, riskAversion = 3
     hmms[t] = fitHMM(retMatrix[t]);
   }
 
-  // Regime-adjusted expected returns
+  // Regime-adjusted expected returns (3 states)
   const adjMeans = {};
   for (const t of selectedTickers) {
     const hmm = hmms[t];
-    const regimeAdj = hmm.currentRegime === "bull" ? 1.1 : 0.85;
+    const regimeAdj = hmm.currentRegime === "bull" ? 1.15
+                    : hmm.currentRegime === "lateral" ? 1.0
+                    : 0.80;
     adjMeans[t] = means[t] * regimeAdj;
   }
 
@@ -403,6 +530,47 @@ function calcORSignals(returns) {
     stopLossAnn:  +(stopLoss * Math.sqrt(252) * 100).toFixed(2),
     tpAnn:        +(takeProfit * Math.sqrt(252) * 100).toFixed(2),
   };
+}
+
+// Per-asset OR signals
+function calcAssetORSignals(retMatrix, weights, dominantRegime) {
+  const assetSignals = {};
+  for (const ticker of Object.keys(weights)) {
+    const rets = retMatrix[ticker];
+    const sl = percentile(rets, 5);
+    const tp = percentile(rets, 99);
+    const vol = std(rets) * Math.sqrt(252);
+    assetSignals[ticker] = {
+      stopLoss:    +(sl * 100).toFixed(3),
+      takeProfit:  +(tp * 100).toFixed(3),
+      stopLossAnn: +(sl * Math.sqrt(252) * 100).toFixed(2),
+      tpAnn:       +(tp * Math.sqrt(252) * 100).toFixed(2),
+      vol:         +(vol * 100).toFixed(1),
+      rebalDay:    dominantRegime === "bull" ? "D1 / D9" : dominantRegime === "lateral" ? "D9" : "D5",
+    };
+  }
+  return assetSignals;
+}
+
+// Next rebalance dates — Bull: D1+D9, Lateral: D9, Bear: D5
+function calcRebalanceDates(dominantRegime) {
+  const today = new Date();
+  const dates = [];
+  for (let m = 0; m < 3; m++) {
+    const base = new Date(today.getFullYear(), today.getMonth() + m + 1, 1);
+    if (dominantRegime === "bull") {
+      dates.push({ date: base.toISOString().slice(0,10), label: "Apertura mes" });
+      const d9 = new Date(base); d9.setDate(9);
+      dates.push({ date: d9.toISOString().slice(0,10), label: "Mid-mes" });
+    } else if (dominantRegime === "lateral") {
+      const d9 = new Date(base); d9.setDate(9);
+      dates.push({ date: d9.toISOString().slice(0,10), label: "Rebalanceo mensual" });
+    } else {
+      const d5 = new Date(base); d5.setDate(5);
+      dates.push({ date: d5.toISOString().slice(0,10), label: "Rebalanceo defensivo" });
+    }
+  }
+  return dates;
 }
 
 // ─── FMP API ──────────────────────────────────────────────────────────────────
@@ -499,10 +667,12 @@ export default function App() {
       for (const t of tickers) hmmResults[t] = fitHMM(retMatrix[t]);
       setProgress(68);
 
-      // Dominant regime across portfolio
-      const bullCount = tickers.filter(t => hmmResults[t].currentRegime === "bull").length;
-      const dominantRegime = bullCount > tickers.length / 2 ? "bull" : "bear";
-      addLog(`✓ Régimen detectado: ${dominantRegime === "bull" ? "ALCISTA" : "BAJISTA"} (${bullCount}/${tickers.length} activos)`, true);
+      // Dominant regime across portfolio (3 states)
+      const regimeCounts = { bull: 0, lateral: 0, bear: 0 };
+      tickers.forEach(t => { regimeCounts[hmmResults[t].currentRegime]++; });
+      const dominantRegime = Object.entries(regimeCounts).sort((a,b) => b[1]-a[1])[0][0];
+      const regimeLabel3 = { bull:"ALCISTA", lateral:"LATERAL", bear:"BAJISTA" }[dominantRegime];
+      addLog(`✓ Régimen detectado: ${regimeLabel3} (Bull:${regimeCounts.bull} Lat:${regimeCounts.lateral} Bear:${regimeCounts.bear})`, true);
 
       // 4. CVaR optimization
       addLog("⟳ Optimizando portafolio (Mean-CVaR + GJR)…");
@@ -558,11 +728,17 @@ export default function App() {
       setProgress(100);
       addLog("✓ Modelo GJR+OR completado", true);
 
+      // Per-asset OR signals
+      const assetSignals = calcAssetORSignals(retMatrix, optWeights, dominantRegime);
+      const rebalDates = calcRebalanceDates(dominantRegime);
+
       setResult({
         weights: optWeights,
         gjr: gjrResults,
         hmm: hmmResults,
         dominantRegime,
+        assetSignals,
+        rebalDates,
         metrics: {
           ret:    +(portRet  * 100).toFixed(2),
           vol:    +(portVol  * 100).toFixed(2),
@@ -595,8 +771,10 @@ export default function App() {
       })).sort((a, b) => b.value - a.value)
     : [];
 
-  const regimeLabel = result?.dominantRegime === "bull" ? "ALCISTA" : "BAJISTA";
-  const regimeClass = result?.dominantRegime === "bull" ? "reg-bull" : "reg-bear";
+  const regimeLabel = result?.dominantRegime === "bull" ? "ALCISTA"
+                   : result?.dominantRegime === "lateral" ? "LATERAL" : "BAJISTA";
+  const regimeClass = result?.dominantRegime === "bull" ? "reg-bull"
+                    : result?.dominantRegime === "lateral" ? "reg-mixed" : "reg-bear";
 
   // Per-asset GJR vol for bar chart
   const gjrBarData = result
@@ -793,11 +971,13 @@ export default function App() {
                   </div>
                   <div className="metric-card">
                     <div className="metric-lbl">Régimen de mercado</div>
-                    <div className={`metric-val ${result.dominantRegime === "bull" ? "pos" : "neg"}`}>
+                    <div className={`metric-val ${result.dominantRegime === "bull" ? "pos" : result.dominantRegime === "lateral" ? "neu" : "neg"}`}>
                       {regimeLabel}
                     </div>
                     <div className="metric-sub">
-                      {Object.values(result.hmm).filter(h => h.currentRegime === "bull").length}/{Object.keys(result.hmm).length} activos alcistas
+                      Bull:{Object.values(result.hmm).filter(h=>h.currentRegime==="bull").length} · 
+                      Lat:{Object.values(result.hmm).filter(h=>h.currentRegime==="lateral").length} · 
+                      Bear:{Object.values(result.hmm).filter(h=>h.currentRegime==="bear").length}
                     </div>
                   </div>
                   <div className="metric-card">
@@ -858,42 +1038,136 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* OR Signals */}
-                <div className="sec-title">Señales de opciones reales</div>
+                {/* HMM State Stats */}
+                <div className="sec-title">Detalle regímenes HMM — 3 estados</div>
                 <div className="card" style={{marginBottom:12}}>
                   <div className="card-hdr">
-                    <span className="card-title">Stop-loss · Take-profit · Timing</span>
-                    <span style={{fontSize:9,color:"var(--muted)"}}>
-                      Wait days post-señal: {result.waitDays}d
-                    </span>
+                    <span className="card-title">Estadísticas por estado · Baum-Welch + Viterbi</span>
                   </div>
-                  <div className="card-body">
-                    <div className="signal-grid">
-                      <div className="signal-box">
-                        <div className="signal-num neg">{result.orSignals.stopLoss}%</div>
-                        <div className="signal-lbl">Stop-loss diario (P5)</div>
+                  <div className="card-body" style={{padding:0}}>
+                    <table className="tbl">
+                      <thead>
+                        <tr>
+                          <th>ETF</th>
+                          <th>Régimen actual</th>
+                          <th>Confianza</th>
+                          <th>μ Bear (anual)</th>
+                          <th>μ Lateral (anual)</th>
+                          <th>μ Bull (anual)</th>
+                          <th>Días Bull / Lat / Bear</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(result.hmm)
+                          .filter(([t]) => result.weights[t])
+                          .sort((a,b) => result.weights[b[0]] - result.weights[a[0]])
+                          .map(([ticker, hmm]) => (
+                          <tr key={ticker}>
+                            <td>
+                              <span style={{
+                                display:"inline-block",padding:"2px 6px",borderRadius:2,
+                                fontSize:9,fontWeight:600,
+                                background:`${ETF_META[ticker]?.color}22`,
+                                color:ETF_META[ticker]?.color
+                              }}>{ticker}</span>
+                            </td>
+                            <td>
+                              <span className={`regime-badge ${hmm.currentRegime==="bull"?"reg-bull":hmm.currentRegime==="lateral"?"reg-mixed":"reg-bear"}`}>
+                                {hmm.currentRegime==="bull"?"BULL":hmm.currentRegime==="lateral"?"LATERAL":"BEAR"}
+                              </span>
+                            </td>
+                            <td style={{color:"var(--text2)"}}>{(hmm.regimeConf*100).toFixed(0)}%</td>
+                            <td className="neg">{hmm.stateStats?.[0]?.mu ?? "—"}%</td>
+                            <td className="neu">{hmm.stateStats?.[1]?.mu ?? "—"}%</td>
+                            <td className="pos">{hmm.stateStats?.[2]?.mu ?? "—"}%</td>
+                            <td style={{fontSize:9,color:"var(--muted)"}}>
+                              {hmm.stateStats?.[2]?.days ?? 0} / {hmm.stateStats?.[1]?.days ?? 0} / {hmm.stateStats?.[0]?.days ?? 0}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* OR Signals per asset */}
+                <div className="sec-title">Señales de opciones reales — por activo</div>
+                <div className="two-col">
+                  <div className="card">
+                    <div className="card-hdr">
+                      <span className="card-title">Stop-loss y Take-profit por ETF</span>
+                      <span style={{fontSize:9,color:"var(--muted)"}}>P5 / P99 retorno diario · Wait {result.waitDays}d</span>
+                    </div>
+                    <div className="card-body" style={{padding:0}}>
+                      <table className="tbl">
+                        <thead>
+                          <tr>
+                            <th>ETF</th>
+                            <th>Peso</th>
+                            <th>Stop-loss</th>
+                            <th>Take-profit</th>
+                            <th>Vol anual</th>
+                            <th>Rebalanceo</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Object.entries(result.assetSignals)
+                            .sort((a,b) => result.weights[b[0]] - result.weights[a[0]])
+                            .map(([ticker, sig]) => (
+                            <tr key={ticker}>
+                              <td>
+                                <span style={{
+                                  display:"inline-block",padding:"2px 6px",borderRadius:2,
+                                  fontSize:9,fontWeight:600,
+                                  background:`${ETF_META[ticker]?.color}22`,
+                                  color: ETF_META[ticker]?.color
+                                }}>{ticker}</span>
+                              </td>
+                              <td style={{color:"var(--text2)"}}>{(result.weights[ticker]*100).toFixed(1)}%</td>
+                              <td className="neg">{sig.stopLoss}%</td>
+                              <td className="pos">{sig.takeProfit}%</td>
+                              <td className="neu">{sig.vol}%</td>
+                              <td style={{fontSize:9,color:"var(--purple)"}}>{sig.rebalDay}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div className="card">
+                    <div className="card-hdr">
+                      <span className="card-title">Calendario de rebalanceo mensual</span>
+                      <span className={`regime-badge ${result.dominantRegime === "bull" ? "reg-bull" : "reg-bear"}`}>
+                        {result.dominantRegime === "bull" ? "D1 + D9" : "D5"}
+                      </span>
+                    </div>
+                    <div className="card-body">
+                      <div style={{fontSize:10,color:"var(--text2)",marginBottom:12,lineHeight:1.7}}>
+                        Régimen <strong style={{color: result.dominantRegime === "bull" ? "var(--green)" : "var(--red)"}}>
+                          {result.dominantRegime === "bull" ? "ALCISTA" : "BAJISTA"}
+                        </strong> → rebalanceo en{" "}
+                        <strong style={{color:"var(--teal)"}}>
+                          {result.dominantRegime === "bull" ? "día 1 y día 9" : "día 5"} de cada mes
+                        </strong>
                       </div>
-                      <div className="signal-box">
-                        <div className="signal-num pos">{result.orSignals.takeProfit}%</div>
-                        <div className="signal-lbl">Take-profit diario (P99)</div>
+                      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                        {result.rebalDates.map((d, i) => (
+                          <div key={i} style={{
+                            display:"flex",alignItems:"center",gap:10,
+                            background:"var(--bg3)",border:"1px solid var(--border)",
+                            borderRadius:3,padding:"8px 12px"
+                          }}>
+                            <span style={{fontSize:11,color:"var(--teal)"}}>◈</span>
+                            <span style={{fontSize:11,color:"var(--text)"}}>{d.date}</span>
+                            <span style={{fontSize:9,color:"var(--muted)",marginLeft:"auto"}}>{d.label}</span>
+                          </div>
+                        ))}
                       </div>
-                      <div className="signal-box">
-                        <div className="signal-num" style={{color:"var(--yellow)"}}>{result.waitDays}d</div>
-                        <div className="signal-lbl">Wait days</div>
-                      </div>
-                      <div className="signal-box">
-                        <div className="signal-num neg">{result.orSignals.stopLossAnn}%</div>
-                        <div className="signal-lbl">Stop anualizado</div>
-                      </div>
-                      <div className="signal-box">
-                        <div className="signal-num pos">{result.orSignals.tpAnn}%</div>
-                        <div className="signal-lbl">TP anualizado</div>
-                      </div>
-                      <div className="signal-box">
-                        <div className="signal-num" style={{color:"var(--purple)"}}>
-                          {result.dominantRegime === "bull" ? "D1/D9" : "D5"}
-                        </div>
-                        <div className="signal-lbl">Ventana rebalanceo</div>
+                      <div style={{marginTop:14,fontSize:9,color:"var(--muted)",lineHeight:1.7}}>
+                        Stop-loss portafolio: <span className="neg">{result.orSignals.stopLoss}%</span> diario ·{" "}
+                        Take-profit: <span className="pos">{result.orSignals.takeProfit}%</span> diario<br/>
+                        TC estimado: 0.5025% por operación · Wait days: {result.waitDays}d
                       </div>
                     </div>
                   </div>
