@@ -406,16 +406,15 @@ function calcORSignals(returns) {
 }
 
 // ─── FMP API ──────────────────────────────────────────────────────────────────
-async function fetchPrices(ticker, from, to, apiKey) {
-  const url = `/fmp/api/v3/historical-price-full/${ticker}?from=${from}&to=${to}&apikey=${apiKey}`;
+async function fetchPrices(ticker, from, to, _apiKey) {
+  const url = `/yahoo/${ticker}?from=${from}&to=${to}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${ticker}`);
   const data = await res.json();
-  if (!data.historical || data.historical.length === 0)
+  if (data.error) throw new Error(data.error);
+  if (!data.prices || data.prices.length === 0)
     throw new Error(`No data for ${ticker}`);
-  // FMP returns newest first
-  const sorted = [...data.historical].sort((a, b) => new Date(a.date) - new Date(b.date));
-  return sorted.map(d => d.adjClose || d.close);
+  return data.prices;
 }
 
 // ─── CUSTOM TOOLTIP ───────────────────────────────────────────────────────────
@@ -638,22 +637,13 @@ export default function App() {
         <div className="layout">
           {/* SIDEBAR */}
           <aside className="sidebar">
-            {/* API Key */}
+            {/* Data source note */}
             <div className="sb-section">
-              <div className="sb-label">Configuración API</div>
-              <div className="field">
-                <label>FMP API Key</label>
-                <input
-                  type="password"
-                  placeholder="tu_api_key_aquí"
-                  value={apiKey}
-                  onChange={e => setApiKey(e.target.value)}
-                />
-              </div>
-              <div style={{fontSize:"9px", color:"var(--muted)", lineHeight:1.6}}>
-                Obtené tu key gratuita en<br/>
-                <span style={{color:"var(--blue)"}}>financialmodelingprep.com</span>
-                <br/>250 req/día · plan Free
+              <div className="sb-label">Fuente de datos</div>
+              <div style={{fontSize:"9px", color:"var(--muted)", lineHeight:1.7}}>
+                <span style={{color:"var(--green)"}}>● Yahoo Finance</span><br/>
+                Precios históricos ajustados<br/>
+                Sin API key requerida · Gratuito
               </div>
             </div>
 
