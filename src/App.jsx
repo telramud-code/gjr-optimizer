@@ -520,57 +520,136 @@ function calcPortfolioVol(weights, retMatrix) {
   return Math.sqrt(Math.max(0, vol2) * 252);
 }
 
-// OR Signals: stop-loss (P5 daily) and take-profit (P99 daily)
+// OR Signals: stop-loss (D1 = P10 anual) and take-profit (D9 = P90 anual)
 function calcORSignals(returns) {
-  const stopLoss  = percentile(returns, 5);
-  const takeProfit = percentile(returns, 99);
+  // Aggregate daily returns into annual rolling windows (252-day)
+  const annualReturns = [];
+  for (let i = 252; i <= returns.length; i++) {
+    const window = returns.slice(i - 252, i);
+    const annRet = window.reduce((acc, r) => acc * (1 + r), 1) - 1;
+    annualReturns.push(annRet);
+  }
+  // Fallback: annualize daily if not enough history
+  const dist = annualReturns.length >= 20 ? annualReturns
+    : returns.map(r => r * 252);
+  const stopLoss   = percentile(dist, 10);  // Decil 1
+  const takeProfit = percentile(dist, 90);  // Decil 9
   return {
-    stopLoss:   +(stopLoss * 100).toFixed(3),
-    takeProfit: +(takeProfit * 100).toFixed(3),
-    stopLossAnn:  +(stopLoss * Math.sqrt(252) * 100).toFixed(2),
-    tpAnn:        +(takeProfit * Math.sqrt(252) * 100).toFixed(2),
+    stopLoss:    +(stopLoss  * 100).toFixed(2),
+    takeProfit:  +(takeProfit * 100).toFixed(2),
+    decil1: +(stopLoss  * 100).toFixed(2),
+    decil9: +(takeProfit * 100).toFixed(2),
   };
 }
 
-// Per-asset OR signals
-function calcAssetORSignals(retMatrix, weights, dominantRegime) {
+// Per-asset OR signals — D1 (P10) y D9 (P90) anuales + señal OR activa
+function calcAssetORSignals(retMatrix, weights, waitDays) {
+  const today = new Date();
   const assetSignals = {};
   for (const ticker of Object.keys(weights)) {
     const rets = retMatrix[ticker];
-    const sl = percentile(rets, 5);
-    const tp = percentile(rets, 99);
+    // Build annual return distribution
+    const annualReturns = [];
+    for (let i = 252; i <= rets.length; i++) {
+      const window = rets.slice(i - 252, i);
+      const annRet = window.reduce((acc, r) => acc * (1 + r), 1) - 1;
+      annualReturns.push(annRet);
+    }
+    const dist = annualReturns.length >= 20 ? annualReturns : rets.map(r => r * 252);
+    const sl = percentile(dist, 10);
+    const tp = percentile(dist, 90);
     const vol = std(rets) * Math.sqrt(252);
+    // Check last return against daily SL/TP thresholds
+    const lastRet = rets[rets.length - 1];
+    const dailySL = percentile(rets, 5);
+    const dailyTP = percentile(rets, 95);
+    const slTriggered = lastRet <= dailySL;
+    const tpTriggered = lastRet >= dailyTP;
+    const signalActive = slTriggered || tpTriggered;
+    const signalType = slTriggered ? "SL" : tpTriggered ? "TP" : null;
+    // Re-entry date = today + waitDays (business days approx)
+    const reEntry = new Date(today);
+    reEntry.setDate(reEntry.getDate() + waitDays);
     assetSignals[ticker] = {
-      stopLoss:    +(sl * 100).toFixed(3),
-      takeProfit:  +(tp * 100).toFixed(3),
-      stopLossAnn: +(sl * Math.sqrt(252) * 100).toFixed(2),
-      tpAnn:       +(tp * Math.sqrt(252) * 100).toFixed(2),
+      stopLoss:    +(sl * 100).toFixed(2),
+      takeProfit:  +(tp * 100).toFixed(2),
       vol:         +(vol * 100).toFixed(1),
-      rebalDay:    dominantRegime === "bull" ? "D1 / D9" : dominantRegime === "lateral" ? "D9" : "D5",
+      signalActive,
+      signalType,
+      reEntryDate: signalActive ? reEntry.toISOString().slice(0,10) : null,
     };
   }
   return assetSignals;
 }
 
-// Next rebalance dates — Bull: D1+D9, Lateral: D9, Bear: D5
-function calcRebalanceDates(dominantRegime) {
+// Next rebalance dates — fixed monthly from portfolio start date
+function calcRebalanceDates(dateFrom) {
+  const start = new Date(dateFrom);
+  const rebalDay = start.getDate(); // same day each month
   const today = new Date();
   const dates = [];
-  for (let m = 0; m < 3; m++) {
-    const base = new Date(today.getFullYear(), today.getMonth() + m + 1, 1);
-    if (dominantRegime === "bull") {
-      dates.push({ date: base.toISOString().slice(0,10), label: "Apertura mes" });
-      const d9 = new Date(base); d9.setDate(9);
-      dates.push({ date: d9.toISOString().slice(0,10), label: "Mid-mes" });
-    } else if (dominantRegime === "lateral") {
-      const d9 = new Date(base); d9.setDate(9);
-      dates.push({ date: d9.toISOString().slice(0,10), label: "Rebalanceo mensual" });
-    } else {
-      const d5 = new Date(base); d5.setDate(5);
-      dates.push({ date: d5.toISOString().slice(0,10), label: "Rebalanceo defensivo" });
-    }
+  let d = new Date(today.getFullYear(), today.getMonth(), rebalDay);
+  // If this month's rebal already passed, start from next month
+  if (d <= today) d = new Date(d.getFullYear(), d.getMonth() + 1, rebalDay);
+  for (let i = 0; i < 3; i++) {
+    const rd = new Date(d.getFullYear(), d.getMonth() + i, rebalDay);
+    dates.push({ date: rd.toISOString().slice(0,10), label: `Rebalanceo mensual (día ${rebalDay})` });
   }
   return dates;
+}
+
+// Risk contribution per asset: weight * marginal contribution to portfolio vol
+function calcRiskContributions(weights, retMatrix) {
+  const tickers = Object.keys(weights);
+  const portVol = calcPortfolioVol(weights, retMatrix);
+  if (portVol === 0) return tickers.map(t => ({ ticker: t, rc: 0, rcPct: 0 }));
+  return tickers.map(t => {
+    let covWithPort = 0;
+    for (const t2 of tickers)
+      covWithPort += weights[t2] * cov(retMatrix[t], retMatrix[t2]);
+    const marginal = covWithPort * 252 / portVol;
+    const rc = weights[t] * marginal;
+    return {
+      ticker: t,
+      rc:    +(rc * 100).toFixed(3),
+      rcPct: +(rc / portVol * 100).toFixed(1),
+      fill:  ETF_META[t]?.color || "var(--teal)",
+    };
+  }).sort((a, b) => b.rcPct - a.rcPct);
+}
+
+// Sensitivity table: vary lambda, compute portfolio metrics
+function buildSensitivity(retMatrix, selectedTickers, currentLambda) {
+  const lambdas = [0.5, 1, 1.5, 2, 3, 4, 5, 6, 8];
+  return lambdas.map(lam => {
+    const w = optimizeCVaR(retMatrix, selectedTickers, 600, lam);
+    if (!w || Object.keys(w).length === 0) return null;
+    const tks = Object.keys(w);
+    const portRet = tks.reduce((s, t) => s + w[t] * mean(retMatrix[t]) * 252, 0);
+    const portVol = calcPortfolioVol(w, retMatrix);
+    const portCVaR = portfolioCVaR(w, retMatrix, 400, 0.05);
+    const sharpe = portVol > 0 ? (portRet - 0.043) / portVol : 0;
+    let nav = 100, peak = 100, maxDD = 0;
+    const nDays = retMatrix[tks[0]].length;
+    for (let i = 0; i < nDays; i++) {
+      let r = 0;
+      for (const t of tks) r += w[t] * retMatrix[t][i];
+      nav *= (1 + r);
+      if (nav > peak) peak = nav;
+      const dd = (nav - peak) / peak;
+      if (dd < maxDD) maxDD = dd;
+    }
+    return {
+      lambda: lam,
+      ret:    +(portRet  * 100).toFixed(2),
+      vol:    +(portVol  * 100).toFixed(2),
+      sharpe: +sharpe.toFixed(3),
+      cvar:   +(portCVaR * 100).toFixed(2),
+      maxDD:  +(maxDD    * 100).toFixed(2),
+      nAssets: Object.keys(w).length,
+      isActive: lam === currentLambda,
+    };
+  }).filter(Boolean);
 }
 
 // ─── FMP API ──────────────────────────────────────────────────────────────────
@@ -729,8 +808,14 @@ export default function App() {
       addLog("✓ Modelo GJR+OR completado", true);
 
       // Per-asset OR signals
-      const assetSignals = calcAssetORSignals(retMatrix, optWeights, dominantRegime);
-      const rebalDates = calcRebalanceDates(dominantRegime);
+      const assetSignals = calcAssetORSignals(retMatrix, optWeights, waitDays);
+      const rebalDates = calcRebalanceDates(dateFrom);
+
+      addLog("⟳ Calculando contribución al riesgo y sensibilidad…");
+      const riskContrib = calcRiskContributions(optWeights, retMatrix);
+      const sensitivity = buildSensitivity(retMatrix, tickers, riskAv);
+      setProgress(99);
+      addLog("✓ Análisis completado", true);
 
       setResult({
         weights: optWeights,
@@ -739,6 +824,8 @@ export default function App() {
         dominantRegime,
         assetSignals,
         rebalDates,
+        riskContrib,
+        sensitivity,
         metrics: {
           ret:    +(portRet  * 100).toFixed(2),
           vol:    +(portVol  * 100).toFixed(2),
@@ -776,18 +863,7 @@ export default function App() {
   const regimeClass = result?.dominantRegime === "bull" ? "reg-bull"
                     : result?.dominantRegime === "lateral" ? "reg-mixed" : "reg-bear";
 
-  // Per-asset GJR vol for bar chart
-  const gjrBarData = result
-    ? Object.entries(result.gjr)
-        .filter(([t]) => result.weights[t])
-        .map(([t, g]) => ({
-          ticker: t,
-          vol: +(g.condVol * 100).toFixed(1),
-          weight: +(result.weights[t] * 100).toFixed(1),
-          fill: ETF_META[t]?.color || "#38bdf8",
-        }))
-        .sort((a, b) => b.vol - a.vol)
-    : [];
+
 
   return (
     <>
@@ -1104,10 +1180,11 @@ export default function App() {
                           <tr>
                             <th>ETF</th>
                             <th>Peso</th>
-                            <th>Stop-loss</th>
-                            <th>Take-profit</th>
+                            <th>Stop-loss (D1)</th>
+                            <th>Take-profit (D9)</th>
                             <th>Vol anual</th>
-                            <th>Rebalanceo</th>
+                            <th>Señal OR</th>
+                            <th>Re-entrada</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -1127,7 +1204,20 @@ export default function App() {
                               <td className="neg">{sig.stopLoss}%</td>
                               <td className="pos">{sig.takeProfit}%</td>
                               <td className="neu">{sig.vol}%</td>
-                              <td style={{fontSize:9,color:"var(--purple)"}}>{sig.rebalDay}</td>
+                              <td>
+                                {sig.signalActive
+                                  ? <span style={{
+                                      display:"inline-block",padding:"2px 6px",borderRadius:2,
+                                      fontSize:9,fontWeight:600,
+                                      background: sig.signalType==="SL" ? "rgba(248,113,113,.15)" : "rgba(52,211,153,.15)",
+                                      color: sig.signalType==="SL" ? "var(--red)" : "var(--green)"
+                                    }}>{sig.signalType} ACTIVA</span>
+                                  : <span style={{fontSize:9,color:"var(--muted)"}}>En espera</span>
+                                }
+                              </td>
+                              <td style={{fontSize:9,color: sig.signalActive ? "var(--yellow)" : "var(--muted)"}}>
+                                {sig.signalActive ? sig.reEntryDate : "—"}
+                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -1165,8 +1255,8 @@ export default function App() {
                         ))}
                       </div>
                       <div style={{marginTop:14,fontSize:9,color:"var(--muted)",lineHeight:1.7}}>
-                        Stop-loss portafolio: <span className="neg">{result.orSignals.stopLoss}%</span> diario ·{" "}
-                        Take-profit: <span className="pos">{result.orSignals.takeProfit}%</span> diario<br/>
+                        Stop-loss portafolio (D1): <span className="neg">{result.orSignals.stopLoss}%</span> anual ·{" "}
+                        Take-profit (D9): <span className="pos">{result.orSignals.takeProfit}%</span> anual<br/>
                         TC estimado: 0.5025% por operación · Wait days: {result.waitDays}d
                       </div>
                     </div>
@@ -1215,73 +1305,80 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* GJR vol bars */}
+                  {/* Risk contribution chart */}
                   <div className="card">
                     <div className="card-hdr">
-                      <span className="card-title">Volatilidad condicional GJR-GARCH</span>
+                      <span className="card-title">Contribución marginal al riesgo del portafolio</span>
                     </div>
                     <div className="card-body" style={{padding:"8px 4px"}}>
                       <ResponsiveContainer width="100%" height={220}>
-                        <BarChart data={gjrBarData} margin={{top:8,right:16,bottom:8,left:0}}>
+                        <BarChart data={result.riskContrib} layout="vertical" margin={{top:4,right:40,bottom:4,left:4}}>
                           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                          <XAxis dataKey="ticker" tick={{fontSize:8,fill:"var(--muted)"}} />
-                          <YAxis tick={{fontSize:8,fill:"var(--muted)"}} tickFormatter={v=>`${v}%`} />
+                          <XAxis type="number" tick={{fontSize:8,fill:"var(--muted)"}} tickFormatter={v=>`${v}%`} />
+                          <YAxis type="category" dataKey="ticker" tick={{fontSize:9,fill:"var(--text2)"}} width={36} />
                           <Tooltip
-                            formatter={(v, name) => [`${v}%`, name === "vol" ? "Vol GJR anual" : "Peso portafolio"]}
+                            formatter={(v, name) => [`${v}%`, name === "rcPct" ? "Contribución al riesgo" : "Vol marginal"]}
                             contentStyle={{background:"var(--bg3)",border:"1px solid var(--border)",fontSize:10}}
                           />
-                          <Legend wrapperStyle={{fontSize:8,color:"var(--muted)"}} />
-                          <Bar dataKey="vol" name="Vol GJR %" radius={[2,2,0,0]}>
-                            {gjrBarData.map((e, i) => <Cell key={i} fill={e.fill} />)}
+                          <Bar dataKey="rcPct" name="rcPct" radius={[0,2,2,0]}>
+                            {result.riskContrib.map((e, i) => (
+                              <Cell key={i} fill={e.fill} />
+                            ))}
                           </Bar>
-                          <Bar dataKey="weight" name="Peso %" fill="rgba(0,212,200,0.3)" radius={[2,2,0,0]} />
                         </BarChart>
                       </ResponsiveContainer>
+                      <div style={{fontSize:8,color:"var(--muted)",paddingLeft:8,marginTop:4}}>
+                        % de contribución de cada activo a la volatilidad total del portafolio (peso × covarianza marginal)
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                {/* Frontier table */}
+                {/* Sensitivity table */}
                 <div className="card">
                   <div className="card-hdr">
-                    <span className="card-title">Tabla de portafolios — Frontera eficiente</span>
+                    <span className="card-title">Análisis de sensibilidad — Aversión al riesgo (λ)</span>
+                    <span style={{fontSize:9,color:"var(--muted)"}}>λ activo: {riskAv}</span>
                   </div>
                   <div className="card-body" style={{padding:0}}>
                     <table className="tbl">
                       <thead>
                         <tr>
-                          <th>#</th>
+                          <th>λ</th>
+                          <th>Retorno esp.</th>
                           <th>Volatilidad</th>
-                          <th>Retorno esperado</th>
                           <th>Sharpe</th>
                           <th>CVaR (95%)</th>
+                          <th>Max DD</th>
+                          <th>N° activos</th>
                           <th>Perfil</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {result.frontier.map((pt, i) => {
-                          const isOpt = Math.abs(pt.vol - result.metrics.vol) < 1 &&
-                                        Math.abs(pt.ret - result.metrics.ret) < 1;
-                          return (
-                            <tr key={i} style={isOpt ? {background:"rgba(0,212,200,0.05)"} : {}}>
-                              <td style={{color:"var(--muted)"}}>{i + 1}</td>
-                              <td className="neu">{pt.vol}%</td>
-                              <td className={pt.ret >= 0 ? "pos" : "neg"}>
-                                {pt.ret > 0 ? "+" : ""}{pt.ret}%
-                              </td>
-                              <td className={pt.sharpe > 0.5 ? "pos" : pt.sharpe > 0 ? "neu" : "neg"}>
-                                {pt.sharpe.toFixed(3)}
-                              </td>
-                              <td className="neg">{pt.cvar}%</td>
-                              <td style={{fontSize:9}}>
-                                {pt.vol < 10 ? <span className="pos">Conservador</span>
-                                  : pt.vol < 16 ? <span className="neu">Moderado</span>
-                                  : <span className="neg">Agresivo</span>}
-                                {isOpt && <span style={{color:"var(--teal)",marginLeft:6}}>← óptimo</span>}
-                              </td>
-                            </tr>
-                          );
-                        })}
+                        {result.sensitivity.map((row, i) => (
+                          <tr key={i} style={row.isActive ? {background:"rgba(0,212,200,0.06)",borderLeft:"2px solid var(--teal)"} : {}}>
+                            <td style={{color: row.isActive ? "var(--teal)" : "var(--text2)", fontWeight: row.isActive ? 600 : 400}}>
+                              {row.lambda}{row.isActive && " ←"}
+                            </td>
+                            <td className={row.ret >= 0 ? "pos" : "neg"}>
+                              {row.ret > 0 ? "+" : ""}{row.ret}%
+                            </td>
+                            <td className="neu">{row.vol}%</td>
+                            <td className={row.sharpe > 0.5 ? "pos" : row.sharpe > 0 ? "neu" : "neg"}>
+                              {row.sharpe.toFixed(3)}
+                            </td>
+                            <td className="neg">{row.cvar}%</td>
+                            <td className="neg">{row.maxDD}%</td>
+                            <td style={{color:"var(--text2)"}}>{row.nAssets}</td>
+                            <td style={{fontSize:9}}>
+                              {row.vol < 10
+                                ? <span className="pos">Conservador</span>
+                                : row.vol < 16
+                                ? <span className="neu">Moderado</span>
+                                : <span className="neg">Agresivo</span>}
+                            </td>
+                          </tr>
+                        ))}
                       </tbody>
                     </table>
                   </div>
